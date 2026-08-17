@@ -191,8 +191,6 @@ var STATIONS = function () {
     return DEFAULT_STATIONS;
   }
 }();
-var STATION_ICONS = { "empfang": "E", "buero": "B", "zi1": "1", "zi2": "2", "zi3": "3", "zi4": "4", "zi5": "5", "zi6": "6", "steri": "S", "springer": "Sp" };
-var STATION_COLORS = { "empfang": "#0f766e", "buero": "#78716c", "zi1": "#2563eb", "zi2": "#7c3aed", "zi3": "#0891b2", "zi4": "#c2410c", "zi5": "#16a34a", "zi6": "#16a34a", "steri": "#db2777", "springer": "#78716c" };
 function genSlots() {
   const s = [];
   for (let h = 7; h < 20; h++) for (let m = 0; m < 60; m += 30) {
@@ -229,16 +227,6 @@ function fmtDate(d) {
 function fmtDateDE(s) {
   const [y, m, d] = s.split("-");
   return `${d}.${m}.${y}`;
-}
-function fmtStamp(iso) {
-  try {
-    var d = new Date(iso);
-    if (isNaN(d.getTime())) return "";
-    var p = function (n) { return String(n).padStart(2, "0"); };
-    return p(d.getDate()) + "." + p(d.getMonth() + 1) + "." + d.getFullYear() + ", " + p(d.getHours()) + ":" + p(d.getMinutes()) + " Uhr";
-  } catch (e) {
-    return "";
-  }
 }
 function weekKey(d) {
   return `wk-${fmtDate(getMonday(d))}`;
@@ -280,6 +268,7 @@ function fbKey(k) {
 }
 function fbSave(k, v) {
   if (!_fbReady || !_tenantId) return;
+  if (_fbAuth && !_fbAuth.currentUser && _tenantId !== "DEMO") return;
   try {
     _fbDb.ref(fbPath() + fbKey(k)).set(v);
   } catch (e) {}
@@ -844,15 +833,6 @@ function autoSchedule(staffList, vacations, weekStartStr, stationConfig, practic
   var plan = {};
   var weekHours = {};
   staffList.forEach(function (s) { weekHours[s.id] = 0; });
-  // Arzt-Assistenz-Paar-Präferenzen (weiche Bevorzugung, symmetrisch)
-  var partnerMap = {};
-  staffList.forEach(function (s) {
-    partnerMap[s.id] = {};
-    (s.partners || []).forEach(function (pid) { partnerMap[s.id][pid] = true; });
-  });
-  function isPreferred(aId, bId) {
-    return !!(partnerMap[aId] && partnerMap[aId][bId]) || !!(partnerMap[bId] && partnerMap[bId][aId]);
-  }
   function histScore(sid, dayIdx, stationId) {
     return historyScores && historyScores[sid + "|" + dayIdx + "|" + stationId] || 0;
   }
@@ -941,13 +921,8 @@ function autoSchedule(staffList, vacations, weekStartStr, stationConfig, practic
       return { from: bestFrom, to: addEnd(bestTo) };
     }
 
-    function sortFair(arr, stationId, preferId) {
+    function sortFair(arr, stationId) {
       arr.sort(function (a, b) {
-        if (preferId) {
-          var pa = isPreferred(a.id, preferId) ? 1 : 0;
-          var pb = isPreferred(b.id, preferId) ? 1 : 0;
-          if (pa !== pb) return pb - pa;
-        }
         var hw = weekHours[a.id] - weekHours[b.id];
         if (Math.abs(hw) > 0.5) return hw;
         if (stationId) {
@@ -958,14 +933,14 @@ function autoSchedule(staffList, vacations, weekStartStr, stationConfig, practic
       });
     }
 
-    function coverStation(stationId, role, fromT, toT, preferId) {
+    function coverStation(stationId, role, fromT, toT) {
       var candidates = avail.filter(function (a) {
         if (a.rooms.indexOf(stationId) < 0) return false;
         if (a.roles.indexOf(role) < 0) return false;
         if (weekHours[a.id] >= a.maxH) return false;
         return getLongestFreeBlock(a, fromT, toT) !== null;
       });
-      sortFair(candidates, stationId, preferId);
+      sortFair(candidates, stationId);
       var covered = {};
       TIME_SLOTS.forEach(function (ts) {
         var t = timeToMin(ts.start);
@@ -1046,9 +1021,9 @@ function autoSchedule(staffList, vacations, weekStartStr, stationConfig, practic
           if (!hasAssist) continue;
           assignBlock(di, room.id, doc.id, docBlock.from, docBlock.to);
           markBusy(doc.id, docBlock.from, docBlock.to);
-          var assistPlaced = coverStation(room.id, "zfa", docBlock.from, docBlock.to, doc.id);
+          var assistPlaced = coverStation(room.id, "zfa", docBlock.from, docBlock.to);
           if (assistPlaced.length === 0) {
-            coverStation(room.id, "azubi", docBlock.from, docBlock.to, doc.id);
+            coverStation(room.id, "azubi", docBlock.from, docBlock.to);
           }
           placed = true;
         }
@@ -1160,109 +1135,6 @@ function personScheduleText(assignments, staff, staffList, weekStart) {
     lines.push(dn + ": " + parts.join(", "));
   });
   return lines.join("\n");
-}
-function _icsEsc(s) {
-  return String(s == null ? "" : s).replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
-}
-function _icsDt(dateObj, hhmm) {
-  var y = dateObj.getFullYear(),
-    m = String(dateObj.getMonth() + 1).padStart(2, "0"),
-    d = String(dateObj.getDate()).padStart(2, "0");
-  var hm = String(hhmm || "00:00").split(":");
-  return y + m + d + "T" + String(hm[0]).padStart(2, "0") + String(hm[1] || "00").padStart(2, "0") + "00";
-}
-// Zusammenhängende Dienstblöcke einer Person je Wochentag (über Stationen gemergt)
-function personWeekBlocks(assignments, staffId) {
-  var stL = {};
-  STATIONS.forEach(function (x) { stL[x.id] = x.label; });
-  var out = [];
-  DAYS.forEach(function (dn, di) {
-    var byTime = {};
-    Object.entries(assignments).forEach(function (entry) {
-      var k = entry[0], sids = entry[1];
-      if (!sids || sids.indexOf(staffId) < 0) return;
-      var p = k.split("-");
-      if (parseInt(p[0]) !== di) return;
-      var t = p[3];
-      if (!byTime[t]) byTime[t] = [];
-      var lbl = stL[p[1]] || p[1];
-      if (byTime[t].indexOf(lbl) < 0) byTime[t].push(lbl);
-    });
-    var times = Object.keys(byTime).sort();
-    var blocks = [];
-    if (times.length) {
-      var rs = times[0], re = times[0], sts = {};
-      byTime[rs].forEach(function (l) { sts[l] = true; });
-      for (var i = 1; i < times.length; i++) {
-        if (timeToMin(times[i]) === timeToMin(re) + 30) {
-          re = times[i];
-          byTime[re].forEach(function (l) { sts[l] = true; });
-        } else {
-          blocks.push({ from: rs, to: addEnd(re), stations: Object.keys(sts) });
-          rs = times[i]; re = times[i]; sts = {};
-          byTime[rs].forEach(function (l) { sts[l] = true; });
-        }
-      }
-      blocks.push({ from: rs, to: addEnd(re), stations: Object.keys(sts) });
-    }
-    out.push({ di: di, blocks: blocks });
-  });
-  return out;
-}
-function buildPersonIcs(assignments, staffList, weekStart, persons) {
-  var multi = persons.length > 1;
-  var stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
-  var lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//statt-Tipex//Schichtplan//DE", "CALSCALE:GREGORIAN", "METHOD:PUBLISH"];
-  var loc = _tenantId && _tenantId !== "DEMO" ? "Praxis " + _tenantId : "Praxis";
-  persons.forEach(function (staff) {
-    var week = personWeekBlocks(assignments, staff.id);
-    week.forEach(function (day) {
-      var dt = new Date(weekStart);
-      dt.setDate(dt.getDate() + day.di);
-      day.blocks.forEach(function (b, bi) {
-        var st = (b.stations || []).join(" / ");
-        var summary = multi ? staff.name + ": " + (st || "Dienst") : (st || "Dienst");
-        var uid = staff.id + "-" + fmtDate(dt) + "-" + bi + "-" + b.from + "@statt-tipex";
-        lines.push("BEGIN:VEVENT");
-        lines.push("UID:" + uid);
-        lines.push("DTSTAMP:" + stamp);
-        lines.push("DTSTART:" + _icsDt(dt, b.from));
-        lines.push("DTEND:" + _icsDt(dt, b.to));
-        lines.push("SUMMARY:" + _icsEsc(summary));
-        lines.push("LOCATION:" + _icsEsc(loc));
-        lines.push("END:VEVENT");
-      });
-    });
-  });
-  lines.push("END:VCALENDAR");
-  return lines.join("\r\n");
-}
-function icsDownload(filename, text) {
-  try {
-    var blob = new Blob([text], { type: "text/calendar;charset=utf-8" });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(function () { document.body.removeChild(a); URL.revokeObjectURL(url); }, 0);
-  } catch (e) {
-    alert("Kalender-Export nicht möglich.");
-  }
-}
-// Teilen-Menü (Handy) mit Download als Fallback (Desktop)
-function icsShare(filename, text) {
-  var file = null;
-  try { file = new File([text], filename, { type: "text/calendar" }); } catch (e) { file = null; }
-  if (file && navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
-    navigator.share({ files: [file], title: "Schichtplan" }).catch(function (err) {
-      // Abbruch durch Nutzer ist ok; bei echtem Fehler herunterladen
-      if (err && err.name !== "AbortError") icsDownload(filename, text);
-    });
-    return;
-  }
-  icsDownload(filename, text);
 }
 function buildPersonLink(assignments, staff, weekStart) {
   var stL = {};
@@ -2645,8 +2517,8 @@ function MobileStationView({
     }
   }, stationData.map(function (sd, si) {
     var firstTime = sd.entries.length > 0 && sd.entries[0].ranges[0] ? sd.entries[0].ranges[0].from : "08:00";
-    var stIcons = STATION_ICONS;
-    var stColors = STATION_COLORS;
+    var stIcons = {"empfang":"E","buero":"B","zi1":"1","zi2":"2","zi3":"3","zi4":"4","zi5":"5","zi6":"6","steri":"S","springer":"Sp"};
+    var stColors = {"empfang":"#0f766e","buero":"#78716c","zi1":"#2563eb","zi2":"#7c3aed","zi3":"#0891b2","zi4":"#c2410c","zi5":"#16a34a","zi6":"#16a34a","steri":"#db2777","springer":"#78716c"};
     return /*#__PURE__*/React.createElement("div", {
       key: sd.station.id,
       onClick: function () {
@@ -3115,7 +2987,6 @@ function ExceptionsEditor(props){
 
 function AvailabilityEditor({
   staff,
-  staffList,
   onSave,
   onCancel
 }) {
@@ -3128,12 +2999,6 @@ function AvailabilityEditor({
     return s.id;
   }));
   const [exc, setExc] = useState(staff.exceptions ? JSON.parse(JSON.stringify(staff.exceptions)) : []);
-  const [partners, setPartners] = useState(staff.partners || []);
-  const [color, setColor] = useState(staff.color || "#0f766e");
-  const COLOR_PRESETS = ["#0f766e", "#2563eb", "#db2777", "#16a34a", "#d97706", "#7c3aed", "#dc2626", "#0891b2", "#ca8a04", "#4b5563"];
-  const togglePartner = id => {
-    setPartners(prev => prev.includes(id) ? prev.filter(function (x) { return x !== id; }) : prev.concat([id]));
-  };
   const toggle = di => {
     const n = {
       ...av
@@ -3180,41 +3045,15 @@ function AvailabilityEditor({
       width: 24,
       height: 24,
       borderRadius: 10,
-      background: color + "20",
+      background: staff.color + "20",
       display: "inline-flex",
       alignItems: "center",
       justifyContent: "center",
       fontSize: 12,
       fontWeight: 700,
-      color: color
+      color: staff.color
     }
   }, staff.name[0]), staff.name), /*#__PURE__*/React.createElement("div", {
-    style: { marginBottom: 14 }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: { fontSize: 11, color: "#a8a29e", fontWeight: 600, marginBottom: 6 }
-  }, "Farbe"), /*#__PURE__*/React.createElement("div", {
-    style: { display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }
-  }, COLOR_PRESETS.map(function (c) {
-    var on = (color || "").toLowerCase() === c.toLowerCase();
-    return /*#__PURE__*/React.createElement("button", {
-      key: c,
-      onClick: function () { setColor(c); },
-      title: c,
-      style: {
-        width: 26, height: 26, borderRadius: "50%", background: c, cursor: "pointer",
-        border: on ? "2px solid #1c1917" : "2px solid #fff",
-        boxShadow: on ? "0 0 0 1px #1c1917" : "0 0 0 1px #e7e5e4"
-      }
-    });
-  }), /*#__PURE__*/React.createElement("label", {
-    title: "Eigene Farbe",
-    style: { display: "inline-flex", alignItems: "center", gap: 4, marginLeft: 4, fontSize: 11, color: "#78716c", cursor: "pointer" }
-  }, /*#__PURE__*/React.createElement("input", {
-    type: "color",
-    value: color,
-    onChange: function (e) { setColor(e.target.value); },
-    style: { width: 26, height: 26, padding: 0, border: "1px solid #e7e5e4", borderRadius: 6, background: "#fff", cursor: "pointer" }
-  }), "eigene"))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 16,
@@ -3422,35 +3261,7 @@ function AvailabilityEditor({
     value: exc,
     onChange: setExc,
     color: staff.color
-  }), (function () {
-    var others = (staffList || []).filter(function (o) { return o.id !== staff.id; });
-    if (others.length === 0) return null;
-    return /*#__PURE__*/React.createElement("div", {
-      style: { marginTop: 14 }
-    }, /*#__PURE__*/React.createElement("div", {
-      style: { fontSize: 11, fontWeight: 700, color: "#a8a29e", marginBottom: 6, textTransform: "uppercase" }
-    }, "Bevorzugte Zusammenarbeit"), /*#__PURE__*/React.createElement("div", {
-      style: { fontSize: 11, color: "#78716c", marginBottom: 8 }
-    }, "Der automatische Vorschlag versucht, diese Personen als Arzt-Assistenz-Paar zusammen einzuteilen."), /*#__PURE__*/React.createElement("div", {
-      style: { display: "flex", flexWrap: "wrap", gap: 6 }
-    }, others.map(function (o) {
-      var on = partners.indexOf(o.id) >= 0;
-      return /*#__PURE__*/React.createElement("button", {
-        key: o.id,
-        onClick: function () { togglePartner(o.id); },
-        style: {
-          padding: "5px 10px",
-          borderRadius: 20,
-          border: on ? "1px solid " + (o.color || "#0f766e") : "1px solid #e7e5e4",
-          background: on ? (o.color || "#0f766e") : "#fff",
-          color: on ? "#fff" : "#44403c",
-          fontSize: 11,
-          fontWeight: 600,
-          cursor: "pointer"
-        }
-      }, o.name);
-    })));
-  })(), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8,
@@ -3464,9 +3275,7 @@ function AvailabilityEditor({
       vacDays: vDays,
       rooms: rooms,
       roles: roles,
-      exceptions: exc,
-      partners: partners,
-      color: color
+      exceptions: exc
     }),
     style: {
       padding: "7px 18px",
@@ -4887,131 +4696,6 @@ function VacationManager({
   })));
 }
 
-// Personen (mit zusammengefassten Zeiten) für einen Tag + eine Station.
-// Jede Person genau einmal, Zeiten dedupliziert; Ärzt:innen zuerst.
-function stationDayEntries(assignments, staffList, di, stId) {
-  var people = {};
-  Object.entries(assignments).forEach(function (entry) {
-    var k = entry[0], sids = entry[1];
-    if (!sids || !sids.length) return;
-    var p = k.split("-");
-    if (parseInt(p[0]) !== di || p[1] !== stId) return;
-    sids.forEach(function (sid) {
-      if (!people[sid]) people[sid] = [];
-      if (people[sid].indexOf(p[3]) < 0) people[sid].push(p[3]);
-    });
-  });
-  var entries = [];
-  Object.entries(people).forEach(function (entry) {
-    var sid = entry[0], times = entry[1];
-    times.sort();
-    var ranges = [], rs = times[0], re = times[0];
-    for (var i = 1; i < times.length; i++) {
-      if (timeToMin(times[i]) === timeToMin(re) + 30) re = times[i];
-      else { ranges.push(rs + "–" + addEnd(re)); rs = times[i]; re = times[i]; }
-    }
-    ranges.push(rs + "–" + addEnd(re));
-    var s = staffList.find(function (x) { return x.id === sid; });
-    if (s) entries.push({ staff: s, ranges: ranges, isArzt: hasRole(s, "arzt") });
-  });
-  entries.sort(function (a, b) {
-    return (b.isArzt ? 1 : 0) - (a.isArzt ? 1 : 0) || (a.ranges[0] || "").localeCompare(b.ranges[0] || "");
-  });
-  return entries;
-}
-// Personen-Pille (Farbe, Name, A-Badge, Zeit) – geteilt von Tag-/Raumansicht.
-function personPill(h, e, key) {
-  return h("span", {
-    key: key,
-    style: { display: "inline-flex", alignItems: "center", gap: 4, padding: "2px 8px", borderRadius: 20, background: e.staff.color + "18", border: "1px solid " + e.staff.color + "30" }
-  }, h("span", { style: { fontSize: 11, fontWeight: 600, color: e.staff.color } }, e.staff.name), e.isArzt && h("span", {
-    style: { fontSize: 7, padding: "1px 3px", borderRadius: 3, background: e.staff.color, color: "#fff", fontWeight: 700 }
-  }, "A"), h("span", {
-    style: { fontSize: 9.5, fontWeight: 500, color: "#78716c", fontVariantNumeric: "tabular-nums" }
-  }, e.ranges.join(", ")));
-}
-// Wochen-Übersicht: pro Tag eine Karte im Stil der Tagesansicht
-// (Stations-Badge + Personen-Pillen; jede Person je Station nur einmal)
-function WeekOverview({ assignments, staffList, vacations, weekStart, practiceHours }) {
-  var h = React.createElement;
-  return h("div", {
-    style: { display: "flex", flexWrap: "wrap", gap: 12, alignItems: "flex-start" }
-  }, DAYS.map(function (dn, di) {
-    var stData = [];
-    STATIONS.forEach(function (st) {
-      var entries = stationDayEntries(assignments, staffList, di, st.id);
-      if (entries.length) stData.push({ station: st, entries: entries });
-    });
-    var dt = new Date(weekStart);
-    dt.setDate(dt.getDate() + di);
-    var ds = fmtDate(dt);
-    var closed = isPracticeClosed(practiceHours || [], ds, di);
-    var absent = vacations.filter(function (v) { return ds >= v.from && ds <= v.to; }).map(function (v) {
-      var s = staffList.find(function (x) { return x.id === v.staffId; });
-      return s ? { note: v.note, name: s.name } : null;
-    }).filter(Boolean);
-    return h("div", {
-      key: di,
-      className: "wk-card",
-      style: { flex: "1 1 220px", minWidth: 200, border: "1px solid #e7e5e4", borderRadius: 12, overflow: "hidden", background: "#fff" }
-    }, h("div", {
-      style: { padding: "8px 12px", background: "#faf9f7", borderBottom: "1px solid #e7e5e4", display: "flex", justifyContent: "space-between", alignItems: "baseline" }
-    }, h("span", { style: { fontWeight: 700, fontSize: 13 } }, dn), h("span", { style: { fontSize: 11, color: "#a8a29e" } }, dt.getDate() + "." + (dt.getMonth() + 1) + ".")), h("div", {
-      style: { padding: "8px 10px", display: "flex", flexDirection: "column", gap: 9 }
-    }, closed ? h("div", { style: { fontSize: 12, color: "#a8a29e", fontStyle: "italic" } }, "Geschlossen") : stData.length === 0 ? h("div", { style: { fontSize: 12, color: "#a8a29e", fontStyle: "italic" } }, "Keine Schichten") : stData.map(function (sd) {
-      var sc = STATION_COLORS[sd.station.id] || "#78716c";
-      var ic = STATION_ICONS[sd.station.id] || (sd.station.label ? sd.station.label[0] : "?");
-      return h("div", { key: sd.station.id }, h("div", {
-        style: { display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }
-      }, h("span", {
-        style: { width: 20, height: 20, borderRadius: 6, background: sc, color: "#fff", fontSize: 10, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }
-      }, ic), h("span", { style: { fontSize: 12, fontWeight: 600, color: "#44403c" } }, sd.station.label)), h("div", {
-        style: { display: "flex", flexWrap: "wrap", gap: 4 }
-      }, sd.entries.map(function (e, ei) { return personPill(h, e, ei); })));
-    }), absent.length > 0 && h("div", {
-      style: { marginTop: 2, paddingTop: 6, borderTop: "1px dashed #e7e5e4", display: "flex", flexWrap: "wrap", gap: 4 }
-    }, absent.map(function (a, ai) {
-      return h("span", { key: ai, style: { fontSize: 10, color: "#c0392b", background: "#fdecea", borderRadius: 12, padding: "1px 8px" } }, a.note + ": " + a.name);
-    }))));
-  }));
-}
-// Raum-Übersicht: pro Raum eine Karte, innen die Woche (Mo–Fr) mit Personen
-function RoomOverview({ assignments, staffList, weekStart, practiceHours }) {
-  var h = React.createElement;
-  return h("div", {
-    style: { display: "flex", flexWrap: "wrap", gap: 12, alignItems: "flex-start" }
-  }, STATIONS.map(function (st) {
-    var days = DAYS.map(function (dn, di) {
-      var dt = new Date(weekStart);
-      dt.setDate(dt.getDate() + di);
-      var ds = fmtDate(dt);
-      return { dn: dn, di: di, closed: isPracticeClosed(practiceHours || [], ds, di), entries: stationDayEntries(assignments, staffList, di, st.id) };
-    });
-    if (!days.some(function (d) { return d.entries.length; })) return null;
-    var sc = STATION_COLORS[st.id] || "#78716c";
-    var ic = STATION_ICONS[st.id] || (st.label ? st.label[0] : "?");
-    return h("div", {
-      key: st.id,
-      className: "wk-card",
-      style: { flex: "1 1 240px", minWidth: 210, border: "1px solid #e7e5e4", borderRadius: 12, overflow: "hidden", background: "#fff" }
-    }, h("div", {
-      style: { padding: "8px 12px", background: sc + "12", borderBottom: "1px solid #e7e5e4", display: "flex", alignItems: "center", gap: 8 }
-    }, h("span", {
-      style: { width: 22, height: 22, borderRadius: 6, background: sc, color: "#fff", fontSize: 11, fontWeight: 700, display: "inline-flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }
-    }, ic), h("span", { style: { fontWeight: 700, fontSize: 13, color: "#44403c" } }, st.label)), h("div", {
-      style: { padding: "6px 10px", display: "flex", flexDirection: "column", gap: 5 }
-    }, days.map(function (d) {
-      return h("div", {
-        key: d.di,
-        style: { display: "flex", gap: 8, alignItems: "baseline", padding: "3px 0", borderBottom: d.di < DAYS.length - 1 ? "1px solid #f5f5f4" : "none" }
-      }, h("span", {
-        style: { fontSize: 10, fontWeight: 700, color: "#a8a29e", width: 22, flexShrink: 0, textTransform: "uppercase" }
-      }, d.dn.slice(0, 2)), d.entries.length === 0 ? h("span", { style: { fontSize: 11, color: "#d6d3d1" } }, d.closed ? "geschlossen" : "—") : h("div", {
-        style: { display: "flex", flexWrap: "wrap", gap: 4 }
-      }, d.entries.map(function (e, ei) { return personPill(h, e, ei); })));
-    })));
-  }).filter(Boolean));
-}
 // WhatsApp share modal
 function ShareModal({
   staffList,
@@ -5026,15 +4710,6 @@ function ShareModal({
   const copyText = staff => {
     const txt = personScheduleText(assignments, staff, staffList, weekStart);
     navigator.clipboard.writeText(txt);
-  };
-  const weekTag = fmtDate(getMonday(weekStart));
-  const downloadIcs = staff => {
-    icsShare("Schichtplan-" + (_san(staff.name) || "person") + "-" + weekTag + ".ics", buildPersonIcs(assignments, staffList, weekStart, [staff]));
-  };
-  const downloadAllIcs = () => {
-    var people = staffList.filter(function (s) { return parseFloat(getWeeklyHours(assignments, s.id)) > 0; });
-    if (!people.length) return;
-    icsShare("Schichtplan-Team-" + weekTag + ".ics", buildPersonIcs(assignments, staffList, weekStart, people));
   };
   return /*#__PURE__*/React.createElement("div", {
     onClick: onClose,
@@ -5085,10 +4760,9 @@ function ShareModal({
     style: {
       fontSize: 11,
       color: "#78716c",
-      marginBottom: 12,
-      lineHeight: 1.5
+      marginBottom: 12
     }
-  }, "Jede Person erhält ihren individuellen Wochenplan. ", /*#__PURE__*/React.createElement("b", { style: { color: "#25D366" } }, "WhatsApp"), " sendet den Plan als Nachricht · ", /*#__PURE__*/React.createElement("b", null, "Kopieren"), " legt ihn in die Zwischenablage · ", /*#__PURE__*/React.createElement("b", null, "📅"), " als Kalender (.ics) zum Teilen/Importieren."), /*#__PURE__*/React.createElement("div", {
+  }, "Jede Person erhält ihren individuellen Wochenplan."), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -5151,30 +4825,15 @@ function ShareModal({
         fontWeight: 600,
         cursor: "pointer"
       }
-    }, "Kopieren"), /*#__PURE__*/React.createElement("button", {
-      onClick: () => downloadIcs(s),
-      title: "Als Kalender (.ics) teilen oder speichern",
-      style: {
-        padding: "4px 10px",
-        borderRadius: 8,
-        border: "1px solid #d6d3d1",
-        background: "#fff",
-        color: "#44403c",
-        fontSize: 11,
-        fontWeight: 600,
-        cursor: "pointer"
-      }
-    }, "📅"));
-  })), /*#__PURE__*/React.createElement("div", {
-    style: { marginTop: 16, marginBottom: 8, paddingTop: 12, borderTop: "1px solid #e7e5e4", fontSize: 10, fontWeight: 700, color: "#a8a29e", textTransform: "uppercase", letterSpacing: 0.5 }
-  }, "Für alle auf einmal"), /*#__PURE__*/React.createElement("button", {
+    }, "Kopieren"));
+  })), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       staffList.forEach((s, i) => {
         if (parseFloat(getWeeklyHours(assignments, s.id)) > 0) setTimeout(() => shareWhatsApp(s), i * 500);
       });
     },
     style: {
-      marginTop: 0,
+      marginTop: 12,
       padding: "7px 18px",
       borderRadius: 10,
       border: "none",
@@ -5185,21 +4844,7 @@ function ShareModal({
       cursor: "pointer",
       width: "100%"
     }
-  }, "Alle per WhatsApp senden"), /*#__PURE__*/React.createElement("button", {
-    onClick: downloadAllIcs,
-    style: {
-      marginTop: 8,
-      padding: "7px 18px",
-      borderRadius: 10,
-      border: "1px solid #d6d3d1",
-      background: "#fff",
-      color: "#44403c",
-      fontSize: 12,
-      fontWeight: 600,
-      cursor: "pointer",
-      width: "100%"
-    }
-  }, "📅 Team als Kalender (.ics)")));
+  }, "Alle per WhatsApp senden")));
 }
 function Schichtplaner() {
   var _STATIONS$find;
@@ -5215,19 +4860,31 @@ function Schichtplaner() {
   const [authUser, setAuthUser] = React.useState(null);
   const [tenantSecured, setTenantSecured] = React.useState(false);
   const [pendingSecure, setPendingSecure] = React.useState(false);
+  const [smRoleFilter, setSmRoleFilter] = React.useState(null);
+  const [undoSnap, setUndoSnap] = React.useState(null);
+  const [showMoreMenu, setShowMoreMenu] = React.useState(false);
+  const [fbConnected, setFbConnected] = React.useState(true);
+  const fbGotData = React.useRef(false);
   const [myRole, setMyRole] = React.useState(null);
-  const [meName, setMeName] = React.useState("");
-  const [lastEdit, setLastEdit] = React.useState(null);
-  const [auditLog, setAuditLog] = React.useState([]);
-  const [showAudit, setShowAudit] = React.useState(false);
-  const [undoCount, setUndoCount] = React.useState(0);
   React.useEffect(function(){
     if (authUser && _tenantId && _tenantId !== "DEMO" && _fbDb) {
-      _fbDb.ref("tenantMembers/" + fbKey(_tenantId) + "/" + authUser.uid).once("value").then(function(s){
-        var m = s.val() || {}; var r = m.role; setMyRole(r); setMeName(m.name || ""); _readOnly = (r === "viewer");
-      }).catch(function(){ setMyRole(null); setMeName(""); _readOnly = false; });
-    } else { setMyRole(null); setMeName(""); _readOnly = false; }
+      _fbDb.ref("tenantMembers/" + fbKey(_tenantId) + "/" + authUser.uid + "/role").once("value").then(function(s){
+        var r = s.val(); setMyRole(r); _readOnly = (r === "viewer");
+      }).catch(function(){ setMyRole(null); _readOnly = false; });
+    } else { setMyRole(null); _readOnly = false; }
   }, [authUser && authUser.uid]);
+  React.useEffect(function () {
+    if (!undoSnap) return;
+    var t = setTimeout(function () { setUndoSnap(null); }, 30000);
+    return function () { clearTimeout(t); };
+  }, [undoSnap]);
+  React.useEffect(function () {
+    if (!_fbDb) return;
+    var ref = _fbDb.ref(".info/connected");
+    var cb = function (s) { setFbConnected(!!s.val()); };
+    try { ref.on("value", cb); } catch (e) {}
+    return function () { try { ref.off("value", cb); } catch (e) {} };
+  }, []);
   React.useEffect(function(){
     if(!_tenantId || _tenantId==="DEMO"){ setAuthReady(true); return; }
     var unsub=function(){};
@@ -5333,6 +4990,7 @@ function Schichtplaner() {
   const [esTo, setEsTo] = useState("");
   useEffect(() => {
     setEditShiftSid(null);
+    setSmRoleFilter(null);
     if (!shiftModal) return;
     var t = shiftModal.time || "08:00";
     setSmFrom(t);
@@ -5343,8 +5001,6 @@ function Schichtplaner() {
     setSmTo(close);
   }, [shiftModal]);
   const [showStationCfg, setShowStationCfg] = useState(false);
-  const [showAdmin, setShowAdmin] = useState(false);
-  const [overviewBy, setOverviewBy] = useState("day");
   const [isMobile, setIsMobile] = useState(function () {
     return typeof window !== "undefined" && window.innerWidth < 768;
   });
@@ -5423,11 +5079,6 @@ function Schichtplaner() {
     return m;
   });
   const saveTimer = useRef(null);
-  // Guard: unterscheidet echte Nutzer-Edits von Remote-Sync/Wochenwechsel,
-  // damit "Letzte Änderung" nicht durch Laden/Fremdänderungen ausgelöst wird.
-  const lastEditSkip = useRef(true);
-  const undoStack = useRef([]);
-  const prevAssignRef = useRef(null);
   const wsStr = fmtDate(weekStart);
   const conflicts = useMemo(() => findConflicts(assignments), [assignments]);
   const violations = useMemo(() => findViolations(assignments, staffList, vacations, wsStr), [assignments, staffList, vacations, wsStr]);
@@ -5572,7 +5223,6 @@ function Schichtplaner() {
       const as = loadData(`praxis-${weekKey(weekStart)}`, null);
       setStaffList(st);
       setVacations(va);
-      lastEditSkip.current = true;
       setAssignments(migrateAssignments(as || buildDefault()));
       setLoaded(true);
 
@@ -5697,7 +5347,6 @@ function Schichtplaner() {
           };
         });
         var proposed = autoSchedule(DEMO_STAFF, demoVac, fmtDate(getMonday(today)), cfg, []);
-        lastEditSkip.current = true;
         setAssignments(proposed);
         saveData("praxis-" + weekKey(getMonday(today)), proposed);
       }
@@ -5705,7 +5354,7 @@ function Schichtplaner() {
       // Firebase real-time listeners
       if (_fbReady) {
         fbListen("praxis-staff", function (v) {
-          if (v) setStaffList(v);
+          if (v) { fbGotData.current = true; setStaffList(v); }
         });
         fbListen("praxis-vacations", function (v) {
           if (v) setVacations(v);
@@ -5729,35 +5378,42 @@ function Schichtplaner() {
     })();
   }, []);
 
+  // Re-register all data listeners after login (rules reject pre-auth listeners permanently)
+  useEffect(() => {
+    if (!loaded || !_fbReady || !_tenantId || _tenantId === "DEMO") return;
+    if (!authUser) return;
+    fbListen("praxis-staff", function (v) { if (v) { fbGotData.current = true; setStaffList(v); } });
+    fbListen("praxis-vacations", function (v) { if (v) setVacations(v); });
+    fbListen("praxis-hours", function (v) { if (v) setPracticeHours(v); });
+    fbListen("praxis-requests", function (v) { if (v) setVacRequests(v); });
+    fbListen("praxis-station-reqs", function (v) { if (v) setStationReqs(v); });
+    fbListen("praxis-stations", function (v) {
+      if (v && v.length > 0) {
+        STATIONS = v;
+        localStorage.setItem("praxis-stations", JSON.stringify(v));
+      }
+    });
+    fbListen("praxis-" + weekKey(weekStart), function (v) {
+      if (v) setAssignments(migrateAssignments(v));
+    });
+  }, [authUser && authUser.uid, loaded]);
+
   // Firebase listener for week-specific assignments
   useEffect(() => {
     if (!loaded) return;
     const wk = `praxis-${weekKey(weekStart)}`;
     const as = loadData(wk, null);
-    lastEditSkip.current = true;
-    undoStack.current = [];
-    prevAssignRef.current = null;
-    setUndoCount(0);
-    setShowAudit(false);
     setAssignments(migrateAssignments(as || buildDefault()));
-    const lek = `praxis-lastedit-${weekKey(weekStart)}`;
-    const auk = `praxis-audit-${weekKey(weekStart)}`;
-    setLastEdit(loadData(lek, null));
-    setAuditLog(loadData(auk, []) || []);
     if (_fbReady) {
       fbListen(wk, function (v) {
-        if (v) { lastEditSkip.current = true; setAssignments(migrateAssignments(v)); }
-      });
-      fbListen(lek, function (v) {
-        if (v) setLastEdit(v);
-      });
-      fbListen(auk, function (v) {
-        if (v) setAuditLog(v);
+        if (v) setAssignments(migrateAssignments(v));
       });
     }
   }, [weekStart, loaded]);
   useEffect(() => {
     if (!loaded) return;
+    if (_tenantId && _tenantId !== "DEMO" && tenantSecured && !authUser) return;
+    if (_tenantId && _tenantId !== "DEMO" && !fbGotData.current && staffList.length === 0) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
       saveData(`praxis-${weekKey(weekStart)}`, assignments);
@@ -5769,44 +5425,6 @@ function Schichtplaner() {
     }, 500);
     return () => clearTimeout(saveTimer.current);
   }, [assignments, staffList, vacations, practiceHours, vacRequests, stationReqs, loaded, weekStart]);
-  // Nur bei echten Nutzer-Edits: Undo-Verlauf + "Letzte Änderung" + Audit-Log.
-  useEffect(() => {
-    if (!loaded) { prevAssignRef.current = assignments; return; }
-    var wasSkip = lastEditSkip.current;
-    lastEditSkip.current = false;
-    if (wasSkip) { prevAssignRef.current = assignments; return; }
-    if (_readOnly) { prevAssignRef.current = assignments; return; }
-    var prev = prevAssignRef.current;
-    // Undo-Stack: vorherigen Stand sichern (max. 30)
-    if (prev) {
-      undoStack.current.push(prev);
-      if (undoStack.current.length > 30) undoStack.current.shift();
-      setUndoCount(undoStack.current.length);
-    }
-    // Kurze Zusammenfassung der Änderung (1 Slot = 0,5 h)
-    var cnt = function (a) { var n = 0; if (a) Object.keys(a).forEach(function (k) { var v = a[k]; if (v && v.length) n += v.length; }); return n; };
-    var before = cnt(prev), after = cnt(assignments);
-    var what = after > before ? "+" + (after - before) * 0.5 + " h geplant" : after < before ? "−" + (before - after) * 0.5 + " h entfernt" : "geändert";
-    prevAssignRef.current = assignments;
-    var by = meName;
-    if (!by) { try { by = localStorage.getItem("fb-name") || ""; } catch (e) { by = ""; } }
-    var rec = { at: new Date().toISOString(), by: by, what: what };
-    setLastEdit(rec);
-    saveData(`praxis-lastedit-${weekKey(weekStart)}`, rec);
-    // Audit-Log: rollend, letzte 50 Einträge
-    var log = (auditLog || []).concat([rec]);
-    if (log.length > 50) log = log.slice(log.length - 50);
-    setAuditLog(log);
-    saveData(`praxis-audit-${weekKey(weekStart)}`, log);
-  }, [assignments]);
-  const doUndo = () => {
-    if (!undoStack.current.length) return;
-    var prev = undoStack.current.pop();
-    setUndoCount(undoStack.current.length);
-    lastEditSkip.current = true;
-    prevAssignRef.current = prev;
-    setAssignments(prev);
-  };
   if (roData) return /*#__PURE__*/React.createElement(ReadOnlyView, {
     data: roData
   });
@@ -6091,7 +5709,14 @@ function Schichtplaner() {
       color: "#1c1917",
       minHeight: "100vh"
     }
-  }, (_tenantId && _tenantId !== "DEMO" && authReady && !tenantSecured) ? /*#__PURE__*/React.createElement(SecureBanner, { onOpen: function(){ setTab("settings"); setPendingSecure(true); } }) : null, /*#__PURE__*/React.createElement("style", {
+  }, (_tenantId && _tenantId !== "DEMO" && authReady && !tenantSecured) ? /*#__PURE__*/React.createElement(SecureBanner, { onOpen: function(){ setTab("settings"); setPendingSecure(true); } }) : null, undoSnap ? /*#__PURE__*/React.createElement("div", {
+    style: { position: "fixed", bottom: 22, left: "50%", transform: "translateX(-50%)", zIndex: 300, display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderRadius: 12, background: "#1c1917", color: "#fff", fontSize: 13, boxShadow: "0 10px 30px rgba(0,0,0,0.3)" }
+  }, /*#__PURE__*/React.createElement("span", null, undoSnap.label), /*#__PURE__*/React.createElement("button", {
+    onClick: function () { setAssignments(undoSnap.data || {}); setUndoSnap(null); },
+    style: { padding: "5px 14px", borderRadius: 8, border: "none", background: "#0f766e", color: "#fff", fontSize: 12, fontWeight: 700, cursor: "pointer" }
+  }, "R\u00fcckg\u00e4ngig")) : null, fbConnected === false ? /*#__PURE__*/React.createElement("div", {
+    style: { position: "fixed", bottom: 22, left: 16, zIndex: 300, display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 20, background: "#fff7ed", border: "1px solid #fdba74", color: "#b45309", fontSize: 11, fontWeight: 600, boxShadow: "0 4px 14px rgba(0,0,0,0.12)" }
+  }, "\u26a0\ufe0f Offline \u2014 \u00c4nderungen werden nachgeholt") : null, /*#__PURE__*/React.createElement("style", {
     dangerouslySetInnerHTML: {
       __html: `
       @media print {
@@ -6106,8 +5731,6 @@ function Schichtplaner() {
         .print-day th{background:#f5f5f4!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;font-size:7px;padding:2px 3px!important;border:0.5px solid #d6d3d1}
         .print-day td{font-size:8px;padding:2px 3px!important;border:0.5px solid #ddd;height:14px}
         .print-chip{font-size:7px!important;padding:1px 3px!important;border-radius:3px!important;border-width:1px!important}
-        .print-only,.print-only *{-webkit-print-color-adjust:exact;print-color-adjust:exact}
-        .wk-card{break-inside:avoid;page-break-inside:avoid;flex:1 1 30%!important}
         @page{size:landscape;margin:8mm}
       }
       .print-only{display:none}
@@ -6167,7 +5790,7 @@ function Schichtplaner() {
       fontVariantNumeric: "tabular-nums",
       cursor: "default"
     }
-  }, "v8.1"), adminMode && /*#__PURE__*/React.createElement("span", {
+  }, "v8.2"), adminMode && /*#__PURE__*/React.createElement("span", {
     style: { marginLeft: 4, fontSize: 9, color: "#0f766e" }
   }, "\u2605"), _tenantId && /*#__PURE__*/React.createElement("span", {
     style: {
@@ -6220,20 +5843,19 @@ function Schichtplaner() {
       fontSize: 10,
       fontWeight: 600
     }
-  }, "⏰ ", violations.size, " Verfügbarkeit"), /*#__PURE__*/React.createElement("button", {
+  }, "⏰ ", violations.size, " Verfügbarkeit"), !isMobile && /*#__PURE__*/React.createElement("button", {
     onClick: () => window.print(),
-    title: "Drucken oder als PDF sichern",
     style: {
-      padding: isMobile ? "8px 12px" : "5px 12px",
-      borderRadius: isMobile ? 10 : 8,
+      padding: "5px 12px",
+      borderRadius: 8,
       border: "1px solid #d6d3d1",
       background: "#fff",
       cursor: "pointer",
-      fontSize: isMobile ? 12 : 11,
+      fontSize: 11,
       fontWeight: 500,
       color: "#44403c"
     }
-  }, isMobile ? "🖨 PDF" : "🖨 Drucken"), /*#__PURE__*/React.createElement("button", {
+  }, "🖨 Drucken"), /*#__PURE__*/React.createElement("button", {
     onClick: () => setShowShare(true),
     style: {
       padding: isMobile ? "8px 12px" : "5px 12px",
@@ -6310,7 +5932,20 @@ function Schichtplaner() {
     var over = staffList.filter(function (s) { return parseFloat(getWeeklyHours(assignments, s.id)) > (s.maxHours || 40); });
     if (!over.length) return null;
     return /*#__PURE__*/React.createElement("div", { className: "no-print", style: { display: "flex", alignItems: "center", gap: 8, padding: "8px 12px", marginBottom: 10, borderRadius: 10, background: "#fff7ed", border: "1px solid #fdba74", fontSize: 12, color: "#b45309" } }, /*#__PURE__*/React.createElement("span", { style: { fontSize: 15 } }, "⚠️"), /*#__PURE__*/React.createElement("span", null, "Über Wochenarbeitszeit: " + over.map(function (s) { var p = parseFloat(getWeeklyHours(assignments, s.id)); var m = s.maxHours || 40; return s.name + " (" + p + "h/" + m + "h, +" + (Math.round((p - m) * 10) / 10) + "h)"; }).join(", ")));
-  }(), /*#__PURE__*/React.createElement("div", {
+  }(), staffList.length === 0 ? /*#__PURE__*/React.createElement("div", {
+    className: "no-print",
+    style: { padding: "18px 20px", marginBottom: 12, borderRadius: 14, background: "#f0fdfa", border: "1px solid #99f6e4" }
+  }, /*#__PURE__*/React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "#0f766e", marginBottom: 4 } }, "Willkommen! In drei Schritten zum ersten Plan"), /*#__PURE__*/React.createElement("div", { style: { fontSize: 12, color: "#44403c", marginBottom: 12 } }, "Ihre Praxis ist angelegt \u2014 jetzt fehlen nur noch die Kolleginnen."), [
+    ["1", "Team anlegen", "Kolleginnen mit Rollen und Arbeitszeiten eintragen", function () { setTab("team"); }],
+    ["2", "\u00d6ffnungszeiten pr\u00fcfen", "Sonder\u00f6ffnungszeiten und Zeiten in den Einstellungen", function () { setTab("settings"); }],
+    ["3", "Vorschlag generieren", "Das Programm plant die erste Woche automatisch", function () { setShowStationCfg(true); }]
+  ].map(function (st) {
+    return /*#__PURE__*/React.createElement("button", {
+      key: st[0],
+      onClick: st[3],
+      style: { display: "flex", alignItems: "center", gap: 10, width: "100%", textAlign: "left", padding: "9px 12px", marginBottom: 4, borderRadius: 10, border: "1px solid #ccfbf1", background: "#fff", cursor: "pointer" }
+    }, /*#__PURE__*/React.createElement("span", { style: { width: 22, height: 22, borderRadius: "50%", background: "#0f766e", color: "#fff", fontSize: 12, fontWeight: 800, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 } }, st[0]), /*#__PURE__*/React.createElement("span", null, /*#__PURE__*/React.createElement("span", { style: { display: "block", fontSize: 13, fontWeight: 700, color: "#1c1917" } }, st[1]), /*#__PURE__*/React.createElement("span", { style: { display: "block", fontSize: 11, color: "#78716c" } }, st[2])));
+  })) : null, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -6358,23 +5993,7 @@ function Schichtplaner() {
       fontSize: isMobile ? 12 : 13,
       fontWeight: 600
     }
-  }, fmtDateDE(wsStr), " – ", fmtDateDE(fmtDate(wEnd))), /*#__PURE__*/React.createElement("div", {
-    style: { width: 1, height: 22, background: "#e7e5e4", margin: "0 2px" }
-  }), myRole !== "viewer" && undoCount > 0 && /*#__PURE__*/React.createElement("button", {
-    onClick: doUndo,
-    title: "Letzte Änderung rückgängig machen",
-    style: {
-      padding: "6px 12px",
-      borderRadius: 8,
-      border: "0.5px solid #e7e5e4",
-      background: "#fff",
-      cursor: "pointer",
-      fontSize: 10,
-      fontWeight: 600,
-      color: "#44403c",
-      marginLeft: 4
-    }
-  }, "↶ Rückgängig (" + undoCount + ")"), /*#__PURE__*/React.createElement("button", {
+  }, fmtDateDE(wsStr), " – ", fmtDateDE(fmtDate(wEnd))), /*#__PURE__*/React.createElement("button", {
     onClick: copyWeek,
     style: {
       padding: "6px 12px",
@@ -6387,7 +6006,105 @@ function Schichtplaner() {
       color: "#78716c",
       marginLeft: 4
     }
-  }, "Woche kopieren"), /*#__PURE__*/React.createElement("button", {
+  }, "Woche kopieren"), myRole !== "viewer" && /*#__PURE__*/React.createElement("div", {
+    style: { position: "relative", display: "inline-block" }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: function () { setShowMoreMenu(!showMoreMenu); },
+    style: { padding: "6px 12px", borderRadius: 8, border: "1px solid #d6d3d1", background: showMoreMenu ? "#f5f5f4" : "#fff", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#44403c" }
+  }, "\u22ef Mehr"), showMoreMenu && /*#__PURE__*/React.createElement("div", {
+    onClick: function () { setShowMoreMenu(false); },
+    style: { position: "absolute", top: "110%", left: 0, zIndex: 60, background: "#fff", border: "1px solid #e7e5e4", borderRadius: 10, padding: 6, display: "flex", flexDirection: "column", gap: 4, minWidth: 210, boxShadow: "0 8px 24px rgba(0,0,0,0.12)" }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: function () {
+      if (confirm("Aktuelle Woche als Standardwoche speichern?")) {
+        saveData("praxis-standard-week", assignments);
+        alert("Standardwoche gespeichert.");
+      }
+    },
+    style: {
+      padding: "6px 12px",
+      borderRadius: 8,
+      border: "0.5px solid #e7e5e4",
+      background: "#fff",
+      cursor: "pointer",
+      fontSize: 10,
+      fontWeight: 500,
+      color: "#78716c"
+    }
+  }, "Als Standard speichern"), /*#__PURE__*/React.createElement("button", {
+    onClick: function () {
+      var sw = loadData("praxis-standard-week", null);
+      if (!sw) {
+        alert("Noch keine Standardwoche gespeichert.");
+        return;
+      }
+      if (confirm("Standardwoche laden? Aktuelle Planung wird ersetzt.")) {
+        setUndoSnap({ data: assignments, label: "Standardwoche geladen" });
+        setAssignments(sw);
+      }
+    },
+    style: {
+      padding: "6px 12px",
+      borderRadius: 8,
+      border: "none",
+      background: "#f5f5f4",
+      cursor: "pointer",
+      fontSize: 10,
+      fontWeight: 600,
+      color: "#44403c"
+    }
+  }, "Standardwoche"), /*#__PURE__*/React.createElement("button", {
+    onClick: function () {
+      if (confirm("Alle Schichten dieser Woche l\u00f6schen?")) {
+        setUndoSnap({ data: assignments, label: "Woche geleert" });
+        setAssignments({});
+      }
+    },
+    style: {
+      padding: "6px 12px",
+      borderRadius: 8,
+      border: "0.5px solid #fecaca",
+      background: "#fff",
+      cursor: "pointer",
+      fontSize: 10,
+      fontWeight: 500,
+      color: "#dc2626"
+    }
+  }, "Leere Woche"), /*#__PURE__*/React.createElement("button", {
+    onClick: function () {
+      var removed = 0;
+      var next = {};
+      Object.keys(assignments || {}).forEach(function (k) {
+        var parts = k.split("-");
+        var di = parseInt(parts[0], 10);
+        var time = parts[3];
+        var dt = new Date(wsStr + "T00:00:00");
+        dt.setDate(dt.getDate() + di);
+        var ds = fmtDate(dt);
+        var closed = isPracticeClosed(practiceHours || [], ds, di);
+        var ph = getPracticeHoursForDay(practiceHours || [], wsStr, di);
+        var drop = false;
+        if (closed) drop = true;else if (ph && time && (time < ph.from || time >= ph.to)) drop = true;
+        if (drop) { removed++; return; }
+        next[k] = assignments[k];
+      });
+      if (removed === 0) { alert("Keine Schichten au\u00dferhalb der \u00d6ffnungszeiten gefunden."); return; }
+      if (confirm(removed + " Schicht-Eintrag(e) au\u00dferhalb der \u00d6ffnungszeiten entfernen?")) {
+        setUndoSnap({ data: assignments, label: removed + " Eintr\u00e4ge entfernt" });
+        setAssignments(next);
+      }
+    },
+    style: {
+      padding: "6px 12px",
+      borderRadius: 8,
+      border: "0.5px solid #fdba74",
+      background: "#fff",
+      cursor: "pointer",
+      fontSize: 10,
+      fontWeight: 500,
+      color: "#ea580c"
+    }
+  }, "Au\u00dferh. \u00d6ffnungszeiten r\u00e4umen"))), myRole !== "viewer" && /*#__PURE__*/React.createElement("button", {
     onClick: function () {
       setShowStationCfg(!showStationCfg);
     },
@@ -6402,23 +6119,6 @@ function Schichtplaner() {
       color: showStationCfg ? "#fff" : "#0f766e"
     }
   }, "Vorschlag"), /*#__PURE__*/React.createElement("div", {
-    style: { width: 1, height: 22, background: "#e7e5e4", margin: "0 2px" }
-  }), /*#__PURE__*/React.createElement("button", {
-    onClick: function () {
-      setShowAdmin(!showAdmin);
-    },
-    title: "Weitere Aktionen: Standardwoche, leeren, aufr\u00e4umen",
-    style: {
-      padding: "6px 12px",
-      borderRadius: 8,
-      border: "0.5px solid #e7e5e4",
-      background: showAdmin ? "#e7e5e4" : "#fff",
-      cursor: "pointer",
-      fontSize: 10,
-      fontWeight: 600,
-      color: "#44403c"
-    }
-  }, "\u2699 Verwaltung"), /*#__PURE__*/React.createElement("div", {
     style: {
       flex: 1
     }
@@ -6449,118 +6149,7 @@ function Schichtplaner() {
       fontWeight: 500,
       cursor: "pointer"
     }
-  }, "Personal"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => {
-      setView("week");
-      setSelectedStaff(null);
-    },
-    style: {
-      padding: isMobile ? "8px 14px" : "6px 14px",
-      borderRadius: 20,
-      border: "none",
-      background: view === "week" ? "#1c1917" : "#f5f5f4",
-      color: view === "week" ? "#fff" : "#78716c",
-      fontSize: isMobile ? 12 : 11,
-      fontWeight: 500,
-      cursor: "pointer"
-    }
-  }, "Übersicht")), showAdmin && /*#__PURE__*/React.createElement("div", {
-    className: "no-print",
-    style: { display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 10, padding: "10px 12px", background: "#faf9f7", borderRadius: 8, border: "1px solid #e7e5e4" }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: { fontSize: 10, fontWeight: 700, color: "#a8a29e", textTransform: "uppercase", letterSpacing: 0.5, marginRight: 2 }
-  }, "Verwaltung"), /*#__PURE__*/React.createElement("button", {
-    onClick: function () {
-      if (confirm("Aktuelle Woche als Standardwoche speichern?")) {
-        saveData("praxis-standard-week", assignments);
-        alert("Standardwoche gespeichert.");
-      }
-    },
-    style: { padding: "6px 12px", borderRadius: 8, border: "0.5px solid #e7e5e4", background: "#fff", cursor: "pointer", fontSize: 10, fontWeight: 500, color: "#78716c" }
-  }, "Als Standard speichern"), /*#__PURE__*/React.createElement("button", {
-    onClick: function () {
-      var sw = loadData("praxis-standard-week", null);
-      if (!sw) {
-        alert("Noch keine Standardwoche gespeichert.");
-        return;
-      }
-      if (confirm("Standardwoche laden? Aktuelle Planung wird ersetzt.")) {
-        setAssignments(sw);
-      }
-    },
-    style: { padding: "6px 12px", borderRadius: 8, border: "none", background: "#f5f5f4", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#44403c" }
-  }, "Standardwoche laden"), /*#__PURE__*/React.createElement("button", {
-    onClick: function () {
-      if (confirm("Alle Schichten dieser Woche löschen?")) {
-        setAssignments({});
-      }
-    },
-    style: { padding: "6px 12px", borderRadius: 8, border: "0.5px solid #fecaca", background: "#fff", cursor: "pointer", fontSize: 10, fontWeight: 500, color: "#dc2626" }
-  }, "Leere Woche"), /*#__PURE__*/React.createElement("button", {
-    onClick: function () {
-      var removed = 0;
-      var next = {};
-      Object.keys(assignments || {}).forEach(function (k) {
-        var parts = k.split("-");
-        var di = parseInt(parts[0], 10);
-        var time = parts[3];
-        var dt = new Date(wsStr + "T00:00:00");
-        dt.setDate(dt.getDate() + di);
-        var ds = fmtDate(dt);
-        var closed = isPracticeClosed(practiceHours || [], ds, di);
-        var ph = getPracticeHoursForDay(practiceHours || [], wsStr, di);
-        var drop = false;
-        if (closed) drop = true;else if (ph && time && (time < ph.from || time >= ph.to)) drop = true;
-        if (drop) { removed++; return; }
-        next[k] = assignments[k];
-      });
-      if (removed === 0) { alert("Keine Schichten außerhalb der Öffnungszeiten gefunden."); return; }
-      if (confirm(removed + " Schicht-Eintrag(e) außerhalb der Öffnungszeiten entfernen?")) {
-        setAssignments(next);
-      }
-    },
-    style: { padding: "6px 12px", borderRadius: 8, border: "0.5px solid #fdba74", background: "#fff", cursor: "pointer", fontSize: 10, fontWeight: 500, color: "#ea580c" }
-  }, "Außerh. Öffnungszeiten räumen")), lastEdit && /*#__PURE__*/React.createElement("div", {
-    className: "no-print",
-    style: {
-      marginTop: -4,
-      marginBottom: 10
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: { display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: { fontSize: 10, color: "#a8a29e" }
-  }, "Zuletzt geändert: " + fmtStamp(lastEdit.at) + (lastEdit.by ? " · " + lastEdit.by : "") + (lastEdit.what ? " · " + lastEdit.what : "")), auditLog && auditLog.length > 0 && /*#__PURE__*/React.createElement("button", {
-    onClick: () => setShowAudit(!showAudit),
-    style: { padding: "2px 8px", borderRadius: 6, border: "0.5px solid #e7e5e4", background: "#fff", cursor: "pointer", fontSize: 10, fontWeight: 600, color: "#78716c" }
-  }, showAudit ? "Verlauf ausblenden" : "Verlauf (" + auditLog.length + ")")), showAudit && auditLog && auditLog.length > 0 && /*#__PURE__*/React.createElement("div", {
-    style: { marginTop: 6, padding: "8px 10px", background: "#faf9f7", border: "1px solid #e7e5e4", borderRadius: 8, maxHeight: 180, overflowY: "auto" }
-  }, auditLog.slice().reverse().map(function (e, i) {
-    return /*#__PURE__*/React.createElement("div", {
-      key: i,
-      style: { fontSize: 10, color: "#57534e", padding: "3px 0", borderBottom: i < auditLog.length - 1 ? "0.5px solid #f0efed" : "none", display: "flex", gap: 8, justifyContent: "space-between" }
-    }, /*#__PURE__*/React.createElement("span", null, fmtStamp(e.at) + (e.by ? " · " + e.by : "")), /*#__PURE__*/React.createElement("span", { style: { color: "#a8a29e", flexShrink: 0 } }, e.what || ""));
-  }))), view === "week" && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
-    className: "no-print",
-    style: { display: "inline-flex", gap: 2, marginBottom: 12, padding: 3, background: "#f5f5f4", borderRadius: 10 }
-  }, [["day", "nach Tag"], ["room", "nach Raum"]].map(function (o) {
-    return /*#__PURE__*/React.createElement("button", {
-      key: o[0],
-      onClick: function () { setOverviewBy(o[0]); },
-      style: { padding: "5px 14px", borderRadius: 8, border: "none", background: overviewBy === o[0] ? "#fff" : "transparent", color: overviewBy === o[0] ? "#1c1917" : "#78716c", fontSize: 11, fontWeight: 600, cursor: "pointer", boxShadow: overviewBy === o[0] ? "0 1px 2px rgba(0,0,0,0.08)" : "none" }
-    }, o[1]);
-  })), overviewBy === "room" ? /*#__PURE__*/React.createElement(RoomOverview, {
-    assignments: assignments,
-    staffList: staffList,
-    weekStart: weekStart,
-    practiceHours: practiceHours
-  }) : /*#__PURE__*/React.createElement(WeekOverview, {
-    assignments: assignments,
-    staffList: staffList,
-    vacations: vacations,
-    weekStart: weekStart,
-    practiceHours: practiceHours
-  })), view === "station" && /*#__PURE__*/React.createElement(React.Fragment, null, showStationCfg && /*#__PURE__*/React.createElement("div", {
+  }, "Personal")), view === "station" && /*#__PURE__*/React.createElement(React.Fragment, null, showStationCfg && /*#__PURE__*/React.createElement("div", {
     style: {
       marginBottom: 10,
       padding: "12px 14px",
@@ -6673,6 +6262,7 @@ function Schichtplaner() {
       });
       loadHistoryScores(wsStr, 6).then(function (hist) {
         var proposed = autoSchedule(staffList, vacations, wsStr, cfg, practiceHours, hist);
+        setUndoSnap({ data: assignments, label: "Wochenplan ersetzt" });
         setAssignments(proposed);
         setShowStationCfg(false);
       });
@@ -6705,6 +6295,7 @@ function Schichtplaner() {
       });
       loadHistoryScores(wsStr, 6).then(function (hist) {
         var proposed = autoSchedule(staffList, vacations, wsStr, cfg, practiceHours, hist);
+        setUndoSnap({ data: assignments, label: "L\u00fccken aufgef\u00fcllt" });
         setAssignments(function (prev) {
           var merged = Object.assign({}, prev);
           Object.keys(proposed).forEach(function (k) {
@@ -7005,7 +6596,6 @@ function Schichtplaner() {
     onChange: setPracticeHours
   })), tab === "team" && /*#__PURE__*/React.createElement("div", null, editingAv ? /*#__PURE__*/React.createElement(AvailabilityEditor, {
     staff: editingAv,
-    staffList: staffList,
     onCancel: () => setEditingAv(null),
     onSave: u => {
       setStaffList(prev => prev.map(s => s.id === u.id ? u : s));
@@ -7327,7 +6917,12 @@ function Schichtplaner() {
         fontWeight: 500
       }
     }, "✎ Bearbeiten")));
-  })))), tab === "settings" && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+  })))), tab === "settings" && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("a", {
+    href: "/anleitung.pdf",
+    target: "_blank",
+    rel: "noopener",
+    style: { display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", marginBottom: 12, borderRadius: 10, background: "#f0fdfa", border: "1px solid #99f6e4", color: "#0f766e", fontSize: 13, fontWeight: 600, textDecoration: "none" }
+  }, "\ud83d\udcd6 Anleitung f\u00fcr Einsteigerinnen (PDF) \u2014 Schritt f\u00fcr Schritt erkl\u00e4rt"), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: 16,
       borderRadius: 10,
@@ -8087,7 +7682,16 @@ function Schichtplaner() {
       flexWrap: "wrap",
       gap: isMobile ? 6 : 4
     }
-  }, staffList.map(s => {
+  }, /*#__PURE__*/React.createElement("div", {
+    style: { gridColumn: "1 / -1", display: "flex", gap: 4, flexWrap: "wrap", marginBottom: 6 }
+  }, [[null, "Alle"], ["arzt", "Arzt"], ["zfa", "ZFA"], ["znp", "ZMP"], ["zmv", "ZMV"], ["azubi", "Azubi"]].map(function (rf) {
+    var on = smRoleFilter === rf[0];
+    return /*#__PURE__*/React.createElement("button", {
+      key: String(rf[0]),
+      onClick: function () { setSmRoleFilter(rf[0]); },
+      style: { padding: "3px 10px", borderRadius: 12, border: on ? "2px solid #0f766e" : "1px solid #d6d3d1", background: on ? "#f0fdfa" : "#fff", color: on ? "#0f766e" : "#78716c", fontSize: 10, fontWeight: 600, cursor: "pointer" }
+    }, rf[1]);
+  })), staffList.filter(s => !smRoleFilter || hasRole(s, smRoleFilter)).map(s => {
     const _adt = new Date(wsStr + "T00:00:00");
     _adt.setDate(_adt.getDate() + shiftModal.day);
     const _ads = fmtDate(_adt);
@@ -8161,26 +7765,7 @@ function Schichtplaner() {
     assignments: assignments,
     weekStart: weekStart,
     onClose: () => setShowShare(false)
-  }), feedbackButton, view === "week" && /*#__PURE__*/React.createElement("div", {
-    className: "print-only"
-  }, /*#__PURE__*/React.createElement("div", {
-    style: { textAlign: "center", marginBottom: 8 }
-  }, /*#__PURE__*/React.createElement("h1", {
-    style: { fontSize: 14, fontWeight: 800, margin: 0 }
-  }, overviewBy === "room" ? "statt-Tipex · Wochenübersicht (nach Raum)" : "statt-Tipex · Wochenübersicht"), /*#__PURE__*/React.createElement("div", {
-    style: { fontSize: 9, color: "#a8a29e" }
-  }, fmtDateDE(wsStr) + " – " + fmtDateDE(fmtDate(wEnd)) + (_tenantId && _tenantId !== "DEMO" ? " · Praxis " + _tenantId : ""))), overviewBy === "room" ? /*#__PURE__*/React.createElement(RoomOverview, {
-    assignments: assignments,
-    staffList: staffList,
-    weekStart: weekStart,
-    practiceHours: practiceHours
-  }) : /*#__PURE__*/React.createElement(WeekOverview, {
-    assignments: assignments,
-    staffList: staffList,
-    vacations: vacations,
-    weekStart: weekStart,
-    practiceHours: practiceHours
-  })), view !== "week" && /*#__PURE__*/React.createElement("div", {
+  }), feedbackButton, /*#__PURE__*/React.createElement("div", {
     className: "print-only"
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -8198,12 +7783,7 @@ function Schichtplaner() {
       fontSize: 9,
       color: "#a8a29e"
     }
-  }, fmtDateDE(wsStr), " – ", fmtDateDE(fmtDate(wEnd)), _tenantId && _tenantId !== "DEMO" ? " · Praxis " + _tenantId : ""), lastEdit && /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 8,
-      color: "#c0c0c0"
-    }
-  }, "Stand: " + fmtStamp(lastEdit.at) + (lastEdit.by ? " · " + lastEdit.by : ""))), DAYS.map((dn, di) => {
+  }, fmtDateDE(wsStr), " – ", fmtDateDE(fmtDate(wEnd)))), DAYS.map((dn, di) => {
     // Collect station->people->time ranges
     const stData = [];
     STATIONS.forEach(st => {
